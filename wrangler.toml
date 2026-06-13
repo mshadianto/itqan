@@ -1,0 +1,18 @@
+# Wrangler config untuk proxy SumoPod ITQĀN
+# Deploy:
+#   1) npm i -g wrangler  (atau pakai dashboard Cloudflare ▸ Workers)
+#   2) wrangler secret put SUMOPOD_API_KEY      # tempel sk-... milikmu (TIDAK ditulis di file ini)
+#   3) wrangler deploy
+#   4) Catat URL Worker: https://itqan-sumopod-proxy.<subdomain>.workers.dev
+#
+# Catatan: SUMOPOD_API_KEY HARUS lewat `wrangler secret put`, jangan ditaruh di [vars].
+
+name = "itqan-sumopod-proxy"
+main = "sumopod-proxy-worker.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+# Verifikasi URL persis di dashboard SumoPod bila berbeda
+SUMOPOD_BASE = "https://ai.sumopod.com/v1"
+# Origin yang diizinkan memanggil Worker (ganti "*" → domainmu untuk produksi)
+ALLOWED_ORIGIN = "https://mshadianto.github.io"

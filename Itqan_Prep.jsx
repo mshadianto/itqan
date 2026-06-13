@@ -730,15 +730,76 @@ const FIGURAL_GENS = [FiguralRotation, FiguralCount, FiguralPolygon, FiguralHand
 const FIGURAL = FIGURAL_GENS.map(f => f());
 
 /* ------------------------------ AI HELPERS ------------------------------ */
+// SumoPod is an OpenAI-compatible (LiteLLM-style) gateway.
+// Priority: cheapest-but-powerful first, then fall back. (No truly-free chat model exists in the catalog.)
+const AI_MODELS = [
+  { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed — termurah, cepat ($0.03/$0.12)" },
+  { id: "gpt-5-nano", label: "GPT-5 nano — sangat murah ($0.05/$0.40)" },
+  { id: "gemini/gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite — stabil ($0.10/$0.40)" },
+  { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash — penalaran kuat, murah ($0.14/$0.28)" },
+  { id: "mimo-v2.5", label: "MiMo v2.5 — murah ($0.14/$0.28)" },
+  { id: "qwen3.6-flash", label: "Qwen 3.6 Flash ($0.25/$1.50)" },
+  { id: "gemini/gemini-3.1-flash-lite", label: "Gemini 3.1 Flash Lite — generasi baru ($0.25/$1.50)" },
+  { id: "MiniMax-M3", label: "MiniMax M3 — konteks 1M ($0.30/$1.20)" },
+  { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro — pintar, output murah ($0.43/$0.87)" },
+  { id: "gpt-5-mini", label: "GPT-5 mini ($0.25/$2.00)" },
+  { id: "glm-5.2", label: "GLM-5.2 — konteks 1M ($1.40/$4.40)" },
+  { id: "claude-haiku-4-5", label: "Claude Haiku 4.5 ($1.00/$5.00)" },
+  { id: "gemini/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro — sangat pintar ($2.00/$12.00)" },
+  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 — kualitas tinggi ($3.00/$15.00)" },
+  { id: "claude-opus-4-8", label: "Claude Opus 4.8 — terkuat ($5.00/$25.00)" },
+];
+// chain used automatically if the chosen model errors/empties out (lintas provider agar tahan gangguan)
+const AI_FALLBACK = ["MiniMax-M2.7-highspeed", "deepseek-v4-flash", "gemini/gemini-2.5-flash-lite", "gpt-5-mini"];
+
+const DEFAULT_AI = {
+  baseUrl: "https://itqan-sumopod-proxy.sopian-hadianto.workers.dev", // Cloudflare Worker proxy; key disimpan sebagai secret di Worker
+  apiKey: "",                           // SENGAJA kosong: otentikasi ditangani Worker, jangan pernah taruh key di sini
+  model: "MiniMax-M2.7-highspeed",
+};
+
+function aiEndpoint(base) {
+  const b = (base || "").trim().replace(/\/+$/, "");
+  if (!b) return "";
+  if (/\/chat\/completions$/.test(b)) return b;
+  if (/\/v1$/.test(b)) return b + "/chat/completions";
+  return b + "/v1/chat/completions";
+}
+
 async function callClaude(messages, maxTokens = 1024, system) {
-  const body = { model: "claude-sonnet-4-6", max_tokens: maxTokens, messages };
-  if (system) body.system = system;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error("AI request failed (" + res.status + ")");
-  const data = await res.json();
-  return (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n").trim();
+  const cfg = (typeof window !== "undefined" && window.__itqAI) || DEFAULT_AI;
+  const url = aiEndpoint(cfg.baseUrl);
+  if (!url) throw new Error("AI belum dikonfigurasi — buka Set ▸ AI.");
+  const msgs = system ? [{ role: "system", content: system }, ...messages] : messages;
+  const chosen = cfg.model || DEFAULT_AI.model;
+  const order = [chosen, ...AI_FALLBACK.filter(m => m !== chosen)];
+  const headers = { "Content-Type": "application/json" };
+  if (cfg.apiKey) headers["Authorization"] = "Bearer " + cfg.apiKey;
+
+  let lastErr;
+  for (const model of order) {
+    try {
+      const res = await fetch(url, {
+        method: "POST", headers,
+        body: JSON.stringify({ model, messages: msgs, max_tokens: maxTokens, temperature: 0.4 }),
+      });
+      if (!res.ok) {
+        lastErr = new Error("HTTP " + res.status);
+        if (res.status === 401 || res.status === 403) throw lastErr; // auth: stop, don't burn fallbacks
+        continue;
+      }
+      const data = await res.json();
+      const m = data && data.choices && data.choices[0] && data.choices[0].message;
+      let txt = m && m.content;
+      if (Array.isArray(txt)) txt = txt.map(p => (p && (p.text || p.content)) || "").join("");
+      if (typeof txt === "string" && txt.trim()) return txt.trim();
+      lastErr = new Error("Respons AI kosong");
+    } catch (e) {
+      lastErr = e;
+      if (/\b401\b|\b403\b/.test(String(e && e.message))) break;
+    }
+  }
+  throw lastErr || new Error("AI gagal");
 }
 function parseJSON(text) {
   let t = text.replace(/```json/gi, "").replace(/```/g, "").trim();
@@ -762,9 +823,28 @@ const DEFAULT_DATA = {
   history: [], // {date, domain, sub, correct, total}
   streak: { count: 0, last: null },
   xp: 0,
+  ai: { ...DEFAULT_AI },
 };
 const todayStr = () => new Date().toISOString().slice(0, 10);
 function yesterdayStr() { const d = new Date(); d.setDate(d.getDate() - 1); return d.toISOString().slice(0, 10); }
+
+// Persistence shim: use window.storage inside claude.ai artifacts; fall back to
+// localStorage on real deployments (GitHub Pages, custom domain) so progress and
+// the AI key survive a page reload.
+const STORE = {
+  async get(k) {
+    try { if (typeof window !== "undefined" && window.storage) return await window.storage.get(k); } catch (e) { }
+    try { const v = localStorage.getItem(k); return v != null ? { value: v } : null; } catch (e) { return null; }
+  },
+  async set(k, v) {
+    try { if (typeof window !== "undefined" && window.storage) return await window.storage.set(k, v); } catch (e) { }
+    try { localStorage.setItem(k, v); } catch (e) { }
+  },
+  async del(k) {
+    try { if (typeof window !== "undefined" && window.storage) return await window.storage.delete(k); } catch (e) { }
+    try { localStorage.removeItem(k); } catch (e) { }
+  },
+};
 
 function useItqan() {
   const [data, setData] = useState(null);
@@ -774,11 +854,11 @@ function useItqan() {
     (async () => {
       let loaded = JSON.parse(JSON.stringify(DEFAULT_DATA));
       try {
-        if (typeof window !== "undefined" && window.storage) {
-          const r = await window.storage.get("itqan:data");
-          if (r && r.value) loaded = { ...loaded, ...JSON.parse(r.value) };
-        }
+        const r = await STORE.get("itqan:data");
+        if (r && r.value) loaded = { ...loaded, ...JSON.parse(r.value) };
       } catch (e) { /* first run / no key */ }
+      loaded.ai = { ...DEFAULT_AI, ...(loaded.ai || {}) };
+      if (typeof window !== "undefined") window.__itqAI = loaded.ai;
       // seed / top-up SRS from VOCAB_ALL
       if (!loaded.srs.cards || loaded.srs.cards.length === 0) {
         loaded.srs.cards = VOCAB_ALL.map(([term, def, gloss], i) => ({
@@ -797,12 +877,13 @@ function useItqan() {
   const persist = useCallback((next) => {
     if (tRef.current) clearTimeout(tRef.current);
     tRef.current = setTimeout(async () => {
-      try { if (window.storage) await window.storage.set("itqan:data", JSON.stringify(next)); } catch (e) { }
+      try { await STORE.set("itqan:data", JSON.stringify(next)); } catch (e) { }
     }, 400);
   }, []);
   const update = useCallback((updater) => {
     setData(prev => {
       const next = typeof updater === "function" ? updater(prev) : updater;
+      if (typeof window !== "undefined" && next && next.ai) window.__itqAI = next.ai;
       persist(next);
       return next;
     });
@@ -1076,7 +1157,7 @@ function Quiz({ items, accent, domain, sub, onFinish, passage, passageTitle, lis
           `You are an expert ${domain.toUpperCase()} tutor. A learner answered this question. Explain clearly and briefly (max 90 words) WHY the correct answer is right and why a common wrong choice is tempting. Use simple language; if the question is in Indonesian, answer in Indonesian.\n\nQuestion: ${q.stem}\nOptions: ${q.choices.map((c, idx) => String.fromCharCode(65 + idx) + ") " + c).join("  ")}\nCorrect: ${String.fromCharCode(65 + q.answer)}`
       }], 300);
       setAiExp(txt);
-    } catch (e) { setAiExp("Tutor AI sedang tidak tersedia. Coba lagi sebentar."); }
+    } catch (e) { setAiExp("Penjelasan AI gagal: " + ((e && e.message) || "tidak tersedia") + ". Atur mesin AI di Set \u25B8 AI lalu coba lagi."); }
     setAiBusy(false);
   };
 
@@ -1369,7 +1450,7 @@ function PracticeView({ data, update, domain }) {
       const qs = await generateQuestions(domain, s.label, diff, 5);
       if (!qs.length) throw new Error("empty");
       setItems(qs); setPassage(null); setPTitle(null); setMode("quiz");
-    } catch (e) { setAiErr("Gagal membuat soal AI. Periksa koneksi lalu coba lagi."); }
+    } catch (e) { setAiErr("Gagal membuat soal AI: " + ((e && e.message) || "?") + ". Cek Set \u25B8 AI (Base URL / API Key / model)."); }
     setAiBusy(false);
   };
   const genMore = async (s) => {
@@ -1378,7 +1459,7 @@ function PracticeView({ data, update, domain }) {
     try {
       const qs = await generateQuestions(domain, s, diff, 5);
       if (qs.length) { setItems(qs); setMode("quiz"); }
-    } catch (e) { setAiErr("Gagal membuat soal AI."); }
+    } catch (e) { setAiErr("Gagal membuat soal AI: " + ((e && e.message) || "?") + ". Cek Set \u25B8 AI."); }
     setAiBusy(false);
   };
 
@@ -1477,7 +1558,7 @@ function WritingView({ back, record }) {
       setEvalRes(r);
       // count toward progress (1 task = treat as practice)
       record({ correct: Math.round((r.overall / 9) * 5), total: 5 }, "writing");
-    } catch (e) { setErr("Penilaian AI gagal. Coba lagi sebentar."); }
+    } catch (e) { setErr("Penilaian AI gagal: " + ((e && e.message) || "?") + ". Cek Set \u25B8 AI."); }
     setBusy(false);
   };
 
@@ -1566,7 +1647,7 @@ function SpeakingView({ back }) {
       const apiMsgs = history.map(m => ({ role: m.role === "u" ? "user" : "assistant", content: m.text }));
       const txt = await callClaude(apiMsgs, 500, sys);
       setMsgs(m => [...m, { role: "a", text: txt }]);
-    } catch (e) { setMsgs(m => [...m, { role: "a", text: "Maaf, penilaian AI sedang tidak tersedia. Coba lagi." }]); }
+    } catch (e) { setMsgs(m => [...m, { role: "a", text: "Penilaian AI gagal: " + ((e && e.message) || "tidak tersedia") + ". Cek Set \u25B8 AI." }]); }
     setBusy(false);
   };
 
@@ -1623,7 +1704,7 @@ function ListeningView({ domain, meta, record, back }) {
       if (!r.questions.length || !r.script.length) throw new Error("empty");
       setActive({ key: "ai", label: "Audio AI", type: "shared", data: r });
       setMode("quiz");
-    } catch (e) { setAiErr("Gagal membuat audio AI. Periksa koneksi lalu coba lagi."); }
+    } catch (e) { setAiErr("Gagal membuat audio AI: " + ((e && e.message) || "?") + ". Cek Set \u25B8 AI."); }
     setAiBusy(false);
   };
 
@@ -1783,7 +1864,7 @@ function TutorView() {
       const apiMsgs = hist.map(m => ({ role: m.role === "u" ? "user" : "assistant", content: m.text }));
       const txt = await callClaude(apiMsgs, 700, sys);
       setMsgs(m => [...m, { role: "a", text: txt }]);
-    } catch (e) { setMsgs(m => [...m, { role: "a", text: "Maaf, tutor sedang tidak tersedia. Coba lagi sebentar." }]); }
+    } catch (e) { setMsgs(m => [...m, { role: "a", text: "Tutor AI gagal: " + ((e && e.message) || "tidak tersedia") + ". Atur mesin AI di Set \u25B8 AI." }]); }
     setBusy(false);
   };
 
@@ -1877,10 +1958,35 @@ function SettingsView({ data, update }) {
   const save = () => update(prev => ({ ...prev, profile: { ...prev.profile, targets: { toefl: +t.toefl, ielts: +t.ielts, tpa: +t.tpa } } }));
   const reset = async () => {
     if (!confirm("Reset semua progres, riwayat, dan kosakata? Tindakan ini permanen.")) return;
-    try { if (window.storage) await window.storage.delete("itqan:data"); } catch (e) { }
+    try { await STORE.del("itqan:data"); } catch (e) { }
     const fresh = JSON.parse(JSON.stringify(DEFAULT_DATA));
     fresh.srs.cards = VOCAB_ALL.map(([term, def, gloss], i) => ({ id: "v" + i, term, def, gloss, ease: 2.5, interval: 0, reps: 0, due: todayStr() }));
     update(fresh);
+  };
+
+  const [ai, setAi] = useState({ ...DEFAULT_AI, ...(data.ai || {}) });
+  const [test, setTest] = useState({ busy: false, ok: false, msg: "" });
+  const saveAi = () => update(prev => ({ ...prev, ai: { baseUrl: ai.baseUrl.trim(), apiKey: ai.apiKey.trim(), model: ai.model } }));
+  const testAI = async () => {
+    setTest({ busy: true, ok: false, msg: "" });
+    const url = aiEndpoint(ai.baseUrl);
+    if (!url) { setTest({ busy: false, ok: false, msg: "Base URL masih kosong." }); return; }
+    try {
+      const headers = { "Content-Type": "application/json" };
+      if (ai.apiKey.trim()) headers["Authorization"] = "Bearer " + ai.apiKey.trim();
+      const res = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: ai.model, messages: [{ role: "user", content: "Reply with exactly: OK" }], max_tokens: 5 }) });
+      if (!res.ok) {
+        const auth = (res.status === 401 || res.status === 403) ? " — API key salah/kosong?" : "";
+        setTest({ busy: false, ok: false, msg: "Gagal: HTTP " + res.status + auth });
+        return;
+      }
+      const d = await res.json();
+      let txt = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+      if (Array.isArray(txt)) txt = txt.map(p => (p && (p.text || p.content)) || "").join("");
+      setTest({ busy: false, ok: true, msg: "Terhubung ✓ — model menjawab: " + (typeof txt === "string" ? txt.slice(0, 40) : "(ok)") });
+    } catch (e) {
+      setTest({ busy: false, ok: false, msg: "Gagal: " + (e && e.message ? e.message : e) + ". Kemungkinan CORS — gunakan proxy Cloudflare Worker." });
+    }
   };
   return (
     <div className="rise">
@@ -1896,6 +2002,37 @@ function SettingsView({ data, update }) {
           </div>
         ))}
         <button className="btn sm" onClick={save}><Check size={14} /> Simpan target</button>
+      </div>
+
+      <div className="card pad-lg" style={{ marginTop: 14, maxWidth: 560 }}>
+        <div className="eyebrow" style={{ marginBottom: 4, color: "var(--tpa)" }}><Sparkles size={11} style={{ verticalAlign: "-1px" }} /> Mesin AI (SumoPod)</div>
+        <div className="sub" style={{ fontSize: 12.5, marginBottom: 14 }}>Semua fitur AI — penjelasan soal, generator soal, audio AI, penilaian Writing/Speaking, dan Tutor — memanggil gateway SumoPod (kompatibel OpenAI). Kunci API hanya tersimpan di browser ini.</div>
+
+        <label className="statk">Base URL</label>
+        <input value={ai.baseUrl} onChange={e => setAi({ ...ai, baseUrl: e.target.value })} placeholder="https://ai.sumopod.com/v1" autoComplete="off"
+          style={{ width: "100%", border: "1.5px solid var(--line)", borderRadius: 9, padding: "9px 11px", fontFamily: "JetBrains Mono", fontSize: 13, margin: "6px 0 4px" }} />
+        <div className="sub" style={{ fontSize: 11.5, marginBottom: 12, color: "var(--muted)" }}>Verifikasi URL persis di dashboard SumoPod. Atau isi URL Cloudflare Worker-mu (lihat catatan keamanan).</div>
+
+        <label className="statk">API Key</label>
+        <input type="password" value={ai.apiKey} onChange={e => setAi({ ...ai, apiKey: e.target.value })} placeholder="sk-… (kosongkan bila pakai Worker)" autoComplete="off"
+          style={{ width: "100%", border: "1.5px solid var(--line)", borderRadius: 9, padding: "9px 11px", fontFamily: "JetBrains Mono", fontSize: 13, margin: "6px 0 12px" }} />
+
+        <label className="statk">Model</label>
+        <select value={ai.model} onChange={e => setAi({ ...ai, model: e.target.value })}
+          style={{ width: "100%", border: "1.5px solid var(--line)", borderRadius: 9, padding: "9px 11px", fontFamily: "Inter", fontSize: 14, margin: "6px 0 6px", background: "#fff" }}>
+          {AI_MODELS.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+        </select>
+        <div className="sub" style={{ fontSize: 12, marginBottom: 14 }}>Default termurah & cepat: <strong>MiniMax M2.7 Highspeed</strong> ($0.03/$0.12 per 1M). Bila model gagal, sistem otomatis mencoba cadangan: DeepSeek V4 Flash → Gemini 2.5 Flash Lite → GPT-5 mini.</div>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button className="btn sm" onClick={saveAi}><Check size={14} /> Simpan AI</button>
+          <button className="btn ghost sm" onClick={testAI} disabled={test.busy}>{test.busy ? <Loader2 size={14} className="spin" /> : <Zap size={14} />} Test koneksi</button>
+        </div>
+        {test.msg && <div className="sub" style={{ fontSize: 13, marginTop: 10, color: test.ok ? "var(--ok)" : "var(--bad)" }}>{test.msg}</div>}
+
+        <div className="explain" style={{ marginTop: 14, fontSize: 12.5, lineHeight: 1.55 }}>
+          <strong style={{ fontWeight: 600 }}>Keamanan & CORS.</strong> Ini situs statis (GitHub Pages), jadi API key yang diisi di sini tersimpan di localStorage browser — jangan pernah commit key ke repo publik. Cara teraman (dan biasanya wajib karena CORS): deploy Cloudflare Worker sebagai proxy — simpan key sebagai secret di Worker, lalu isi Base URL dengan URL Worker dan kosongkan field API Key. Kode Worker ada di berkas <span className="mono">sumopod-proxy-worker.js</span>.
+        </div>
       </div>
 
       <div className="card pad-lg" style={{ marginTop: 14, maxWidth: 480 }}>
