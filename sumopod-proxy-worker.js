@@ -34,9 +34,18 @@
 const DEFAULT_BASE = "https://ai.sumopod.com/v1"; // ganti bila SumoPod memakai host lain
 
 function cors(origin, allowed) {
-  const allow = (!allowed || allowed === "*") ? "*" : allowed;
+  // `allowed` = "*" atau daftar origin dipisah koma, mis.
+  //   "https://itqan.mshadianto.id,https://mshadianto.github.io,http://localhost:5173"
+  // Kembalikan origin pemanggil bila ada di daftar; jika tidak, pakai origin pertama.
+  let allowOrigin;
+  if (!allowed || allowed.trim() === "*") {
+    allowOrigin = "*";
+  } else {
+    const list = allowed.split(",").map(s => s.trim()).filter(Boolean);
+    allowOrigin = (origin && list.includes(origin)) ? origin : (list[0] || "*");
+  }
   return {
-    "Access-Control-Allow-Origin": allow,
+    "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",

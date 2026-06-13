@@ -14,5 +14,6 @@ compatibility_date = "2025-01-01"
 [vars]
 # Verifikasi URL persis di dashboard SumoPod bila berbeda
 SUMOPOD_BASE = "https://ai.sumopod.com/v1"
-# Origin yang diizinkan memanggil Worker (ganti "*" → domainmu untuk produksi)
-ALLOWED_ORIGIN = "https://mshadianto.github.io"
+# Origin yang diizinkan memanggil Worker — daftar dipisah koma (tanpa spasi wajib).
+# Sertakan domain baru + github.io (transisi) + localhost (dev).
+ALLOWED_ORIGIN = "https://itqan.mshadianto.id,https://mshadianto.github.io,http://localhost:5173"
